@@ -1,0 +1,536 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Apr 09 12:26:14 2015
+
+@author: djgersh
+"""
+
+"""
+Analyze Operating Point Calibration Data (Commissioning)
+
+Author:  Daniel J. Gershman (daniel.j.gershman@nasa.gov)
+
+Created on 04/6/2015
+
+Copyright 2015 NASA Goddard Space Flight Center
+
+"""
+
+__contact__ = 'Dan Gershman (daniel.j.gershman@nasa.gov)'
+import scipy.sparse as sp
+from scipy.sparse import linalg
+from mpl_toolkits.mplot3d import Axes3D
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import matplotlib as matplotlib
+import numpy as np
+import cPickle
+import scipy.special as special
+import gc as gc
+import sys as sys
+import scipy.optimize as optimize
+import scipy.special as special
+import scipy.io as io
+import csv as csv
+import glob as glob
+import scipy.interpolate as interp
+import pdb
+import os
+from spacepy import pycdf
+import scipy as sci
+from itertools import groupby
+from xlrd import open_workbook
+
+
+
+def cdf(trs,Q,gamma):
+    
+    # Gamma Distribution CDF
+
+    f = 1. - special.gammainc(gamma,trs/Q)
+
+    return f
+
+def Ns(trs,lim0cr,Q,gamma,aaxts):  
+
+    N = lim0cr*cdf(trs,Q,gamma)
+    
+    Nxt1 = lim0cr*cdf(trs/aaxts[0],Q,gamma)   
+    Nxt2 = lim0cr*cdf(trs/aaxts[1],Q,gamma) 
+
+    return (N,Nxt1,Nxt2)
+    
+    
+def pdf(trs,Q,gamma):
+    f = 1./(special.gamma(gamma)*(Q**(gamma))) * trs**(gamma-1.) * np.exp(-trs/Q)
+    return f
+
+def Nspdf(trs,lim0cr,Q,gamma,aaxts):
+    N = lim0cr*pdf(trs,Q,gamma)
+    
+    Nxt1 = lim0cr*pdf(trs/aaxts[0],Q,gamma)   
+    Nxt2 = lim0cr*pdf(trs/aaxts[1],Q,gamma) 
+
+    return (N,Nxt1,Nxt2)    
+    
+
+
+
+def N_fitres(inputs,trs,Nd00,px,aaxts,gamma):
+    
+    (lim0cr,Q) = inputs
+
+    if Q < 0 or lim0cr < 0:
+        return 1e100
+        
+
+    (N,Nxt1,Nxt2) = Ns(trs,np.tile(lim0cr,trs.size),np.tile(Q,trs.size),np.tile(gamma,trs.size),aaxts)
+
+    Nfit = N
+    
+    if px > 0:
+        Nfit += Nxt1
+    
+    if px > 1:
+        Nfit += Nxt2
+    
+    if px < 14:
+        Nfit += Nxt2
+        
+    if px < 15:
+        Nfit += Nxt1
+    
+
+    fit_res = (np.log10(Nfit)-np.log10(Nd00))/np.log10(Nd00)
+    fit_res = fit_res[np.isfinite(fit_res)]
+        
+    return fit_res
+
+
+     
+
+def proc_tswp(cs,trs,ms,aaxt,unit,head,cii):
+    
+
+    oppt_param = np.zeros((len(cs),2,16,5,2),np.float)
+
+    prefix = 'FM%sH%i' % (str(unit).zfill(3),head)   
+        
+
+    counts_sub = np.sum(np.sum(cs[cii][:,:,head,:,:]*1.,axis=0),axis=0)
+
+    counts_sub[counts_sub == 1] = 0.    
+
+    Nmax = np.max(counts_sub)*2.
+    Nmin = 0.5
+
+    l10Max = 10**np.floor(np.log10(Nmax))                    
+
+    trsf = np.logspace(3,8,100)
+        
+    Nmax = np.max(counts_sub)*2.
+    Nmin = np.min(counts_sub[counts_sub > 0])*0.5
+    
+    l10Max = 10**np.floor(np.log10(Nmax))                    
+
+    R2 = np.zeros((16,3),np.float)
+    minr2s = np.ones(16,np.float)*100.
+    l0s = np.zeros((16,3,2),np.float)
+
+    if Nmax > 0:                
+
+        for px in range(16):
+
+            Nd00 = counts_sub[:,px]
+
+            
+            if(len(np.where(Nd00 > 0)[0]) > 3):
+                p1 = Nd00[0:5]
+                p2 = Nd00[5:10]
+                p3 = Nd00[10:15]
+                
+                mms = [np.mean(p1[p1 > 0]),np.mean(p2[p2 > 0]),np.mean(p3[p3 > 0])]                             
+                
+                for ii in range(3):
+                    
+                    gam = 1.1
+                    
+                    lim0cr = mms[ii]
+                    cNd00 = Nd00*1.
+                    cNd00[cNd00 > lim0cr*3.] = 0.
+
+                    g_xt = np.where(Nd00[Nd00 > 0] > lim0cr*2.)[0]
+                    g_sig = np.where(Nd00[Nd00 > 0] < lim0cr*0.5)[0]
+                                  
+                    if len(g_sig) > 0:
+                      
+                        g_sig = trs[g_sig[0]]
+                        g_xt = g_sig*aaxt[0]
+                        
+                    elif len(g_sig) == 0 and len(g_xt) > 0:
+                       
+                        g_xt = trs[g_xt[-1]]
+                        g_sig = g_xt/aaxt[0]
+                        
+                    else:
+                        if ii > 0:    
+                            g_xt = trs[0]
+                            g_sig = g_xt/aaxt[0]
+                        
+                        else:
+                         
+                            g_sig = trs[-1]
+                            
+                        
+                    Q = g_sig/(gam*(3.*gam-0.8)/(3.*gam+0.2))
+                    
+                    guesses = np.array([lim0cr,Q])
+                    l0s[px,ii,0] = lim0cr
+                    
+                    if lim0cr > 0 and Q > 0 and gam > 0 and len(np.where(cNd00 > 0)[0]) > 3:
+                    
+                        kd,cov,infodict,mesg,ier = optimize.leastsq(N_fitres,guesses,args=(trs,cNd00,px,aaxt,gam),full_output=True)
+                        s_sq = (infodict['fvec']**2).sum()/ (len(infodict['fvec'])-len(kd))     
+                        cov = None
+                        if(cov == None):
+                            kderr = 0.*kd
+                            pcov = np.zeros((kd.size,kd.size),np.float)
+                        else:
+                            pcov = cov * s_sq    
+                            kderr = np.sqrt(pcov).diagonal() # 1sig confidence interval
+                        
+                        (lim0cr,Q) = kd
+                        (lim0crerr,Qerr) = kderr
+                        gamma = gam
+                        gammaerr = 0.
+                        
+                        if lim0cr > 0:
+                            (N,Nxt1,Nxt2) = Ns(trsf,lim0cr,Q,gamma,aaxt)
+                            (Nt,Nxt1t,Nxt2t) = Ns(trs,lim0cr,Q,gamma,aaxt)
+                                    
+                            Nfit = N
+                            Nfitt = Nt
+ 
+                            
+                            if px > 0:
+                                Nfit += Nxt1
+                                Nfitt += Nxt1t
+                            
+                            if px > 1:
+                                Nfit += Nxt2
+                                Nfitt += Nxt2t
+                            
+                            if px < 14:
+                                Nfit += Nxt2
+                                Nfitt += Nxt2t
+                                
+                            if px < 15:
+                                Nfit += Nxt1
+                                Nfitt += Nxt1t
+                                                                                        
+         
+                            Nfitc = Nfitt[cNd00 > 0]
+                            Ndatac = cNd00[cNd00 > 0]
+
+                            
+                            R2[px,ii] = 100.*np.sum(((Nfitc-Ndatac)/Ndatac)**2) / len(np.where(cNd00 > 0)[0])
+
+                            Gain = Q*gamma*(3.*gamma-0.8)/(3.*gamma+0.2)
+                            Gerr = np.abs(Qerr/Q)*Gain
+    
+                            if Qerr > Q:
+                                Qerr = Q*0.
+                            
+                            if gammaerr > gamma:
+                                gammaerr = gamma*0.
+                                
+                            if lim0crerr > lim0cr:
+                                lim0crerr = lim0cr*0.
+    
+                            if Gerr > Gain:
+                                Gerr = Gain*0.
+     
+                            l0s[px,ii,1] = lim0cr
+                            R2s = R2[px,:]
+
+                            lratio = l0s[px,ii,1]/l0s[px,ii,0]                            
+                            
+                            if len(R2s[R2s > 0]) > 0:
+                                if ii == 0 or (ii == 1 and R2[px,ii]<minr2s[px] and np.abs(lratio-1.) < 0.3 ) or (ii == 2 and R2[px,ii]<minr2s[px] and np.abs(lratio-1.) < 0.3 and len(np.where(cNd00 > 0)[0]) > 8):
+                                    minr2s[px] = R2[px,ii]
+                                    oppt_param[cii,head,px,0,0] = Q
+                                    oppt_param[cii,head,px,1,0] = gamma
+                                    oppt_param[cii,head,px,2,0] = lim0cr
+                                    oppt_param[cii,head,px,3,0] = Gain
+        
+                                    oppt_param[cii,head,px,0,1] = Qerr
+                                    oppt_param[cii,head,px,1,1] = gammaerr
+                                    oppt_param[cii,head,px,2,1] = lim0crerr
+                                    oppt_param[cii,head,px,3,1] = Gerr                        
+                                    oppt_param[cii,head,px,4,0] = ms
+                               
+    return oppt_param 
+ 
+
+def get_serial_number(filename):
+    #George Clark
+
+    st1 = filename.split('/')
+    st2 = st1[-1].split('_')
+    obs = st2[0].split('mms')[-1]
+    spec = st2[1].split('s')[-1]
+
+    species = st2[1].split('s')[0]
+
+    serial_des = np.array([[209,211,212,207],[203,204,201,202],[206,216,213,214],[215,210,208,205]])
+    serial_dis = np.array([[2,5,6,14],[14,1,9,12],[8,15,16,7],[10,11,3,4]])
+
+    if species == 'de':
+        serial = serial_des[int(obs)-1][int(spec)]
+    else:
+        serial = serial_dis[int(obs)-1][int(spec)]
+
+
+    return serial
+
+
+def threshconver(ser,h,xvalues):
+    #George Clark
+
+    serial = str(ser)
+    head = str(h)
+    serial_st = 'DES S/N '+serial #+' '+'Head '+head
+    head_st = 'Head '+head
+    path = '/Users/gbclark1/svn/FPIdataProcTools/FPIthresholdConvert/data/'
+    xlsfile = path+'FPIthresholdConversions.xls'
+
+    book = open_workbook(xlsfile)
+    name = book.sheet_names()
+    sheet = book.sheet_by_name('Sheet1')
+
+    # find the first column where the serial number matches
+    for cell in range(sheet.ncols):
+        dummy = sheet.col(cell)
+        if dummy[0].value  == serial_st: break
+
+    # determine the column for the correct head
+    if sheet.col(cell)[1].value == head_st:
+        cell = cell
+    else:
+        cell = cell+1
+
+
+    #for electrons
+
+    if int(serial) > 200:
+        thresh_volt = []
+        data = []
+        for i in range(2,26,1):
+            data.append(sheet.col(cell)[i].value)
+            thresh_volt.append(sheet.col(0)[i].value)
+
+    #for ions
+    if int(serial) < 200:
+        thresh_volt =[]
+        data = []
+        for i in range(29,47,1):
+            data.append(sheet.col(1)[i].value)
+            thresh_volt.append(sheet.col(0)[i].value)
+
+    threshs = np.interp(xvalues,thresh_volt,data)
+
+    return threshs
+
+
+
+
+def create_counts_matrix(dir):
+    #George Clark
+
+    cdf_filenames = glob.glob(dir+'/*sigthrsh*.cdf')
+    serial=[]
+    loop_index = 0
+    counts = np.zeros(shape=(16,8,8,2,16,16))
+    threshs = np.zeros(shape=(16,2,16))
+    mcps = np.zeros(shape=(16,2))
+
+
+    # pdb.set_trace()
+    ####  ADD THRESH 01 AND MAKE ARRAYS LENTGH 16 [4DES,4DIS, 2MCPV = 16]
+
+    for files in cdf_filenames:
+        print files
+        serial.append(get_serial_number(files))
+
+        cdf = pycdf.CDF(files)
+        cdf_keys = np.array(cdf.keys()[:])
+
+        # extract the tag names for the data we need to construct the count matrix
+        counts_head0_name = cdf_keys[np.char.find(cdf_keys,'counts_Head0') > -1]  #this does not assume a specific mms or dis/des number
+        counts_head1_name = cdf_keys[np.char.find(cdf_keys,'counts_Head1') > -1]
+        thresh_index_name = cdf_keys[np.char.find(cdf_keys,'thresh_index') > -1]
+        it_index_name = cdf_keys[np.char.find(cdf_keys,'iteration_index') > -1]
+        eg_index_name = cdf_keys[np.char.find(cdf_keys,'energy_index') > -1]
+        pixel_index_name = cdf_keys[np.char.find(cdf_keys,'pixel_index') > -1]
+        thresh_volt_name = cdf_keys[np.char.find(cdf_keys,'ThrshV') > -1]
+        mcp_h0_name = cdf_keys[np.char.find(cdf_keys,'MCPvlt_Head0') > -1]
+        mcp_h1_name = cdf_keys[np.char.find(cdf_keys,'MCPvlt_Head1') > -1]
+
+        # use indices defined above to pull out data
+        thresh_volt = np.array(cdf[thresh_volt_name[0]])
+        counts_h0 = np.array(cdf[counts_head0_name[0]])
+        counts_h1 = np.array(cdf[counts_head1_name[0]])
+        thresh_index = np.array(cdf[thresh_index_name[0]])
+        eg_index = np.array(cdf[eg_index_name[0]])
+        pixel_index = np.array(cdf[pixel_index_name[0]])
+        it_index = np.array(cdf[it_index_name[0]])
+        mcp_h0 = np.array(cdf[mcp_h0_name[0]])
+        mcp_h1 = np.array(cdf[mcp_h1_name[0]])
+
+        #pdb.set_trace()
+
+        # create an array based on the unique values in the parameter (probably use for looping)
+        it_uniq = np.unique(it_index)
+        pixel_uniq = np.unique(pixel_index)
+        thresh_uniq = np.unique(thresh_index)
+        eg_uniq = np.unique(eg_index)
+
+        # need to remove double threshV at the first ESA voltage step, this step is not needed once the bug is fixed in the CDF files
+        double_thresh_values = np.where(thresh_volt == np.roll(thresh_volt,-1)) # how many elements do I roll and in which direction?
+        new_thresh_volt = np.delete(thresh_volt[:],double_thresh_values)
+        new_mcp_h0 = np.delete(mcp_h0[:],double_thresh_values)
+        new_mcp_h1 = np.delete(mcp_h1[:],double_thresh_values)
+
+        mcp_h0_new_shape = new_mcp_h0.reshape(16,8,8)
+        mcp_h1_new_shape = new_mcp_h1.reshape(16,8,8)
+        thresh_volt_new_shape = new_thresh_volt.reshape(8,8,16)
+
+        #pdb.set_trace()
+
+        # now we need to restructure the data to match input for Dan's code
+
+        for ll in range(0,2,1):
+            threshs[loop_index,ll,:] = threshconver(serial[loop_index],ll,thresh_volt_new_shape[0,0,:])
+            if ll == 0: mcps[loop_index,ll] = mcp_h0_new_shape[loop_index,0,0]
+            if ll == 1: mcps[loop_index,ll] = mcp_h1_new_shape[loop_index,0,0]
+           # pdb.set_trace()
+            for pp in range(0,16,1):
+
+                new_counts_h0 = np.roll(np.delete(counts_h0[:,pp],double_thresh_values),1) # here I remove the double thresh values and roll the array by one to the right, there is still a slight error (talk to george)
+                new_counts_h1 = np.roll(np.delete(counts_h1[:,pp],double_thresh_values),1)
+
+                #reshape the 1-D counts array
+                counts_h0_new_shape = new_counts_h0.reshape(8,8,16) #[esa volts, iteration,threshs]
+                counts_h1_new_shape = new_counts_h1.reshape(8,8,16) # or 16,8,8 ....it's a mystery!
+
+                for jj in range(len(it_uniq)):
+                    for kk in range(len(thresh_uniq)):
+                        for ii in range(len(eg_uniq)):
+
+                            if ll == 0:
+                                counts[loop_index,jj,ii,ll,kk,pp]=counts_h0_new_shape[ii,jj,kk] #[kk,jj,ii]
+                            else:
+                                counts[loop_index,jj,ii,ll,kk,pp]=counts_h1_new_shape[ii,jj,kk] #[kk,jj,ii]
+
+        loop_index=loop_index+1
+
+    #hard coded aaxts values....is there anyway these could be placed into the CDF??
+    aaxts = np.array([[0.022, 0.007],[0.022, 0.007],[0.022, 0.007],[0.022, 0.007],[0.022, 0.007],[0.022, 0.007],[0.022, 0.007],[0.022, 0.007],[2.49999994e-03,9.99999997e-07],[2.49999994e-03,9.99999997e-07],[2.49999994e-03,9.99999997e-07],[2.49999994e-03,9.99999997e-07],[2.49999994e-03,9.99999997e-07],[2.49999994e-03,9.99999997e-07],[2.49999994e-03,9.99999997e-07],[2.49999994e-03,9.99999997e-07]])
+    return counts, serial, threshs, mcps, aaxts
+
+Obs = 2
+
+pxs = np.arange(0,16)
+                     
+for FPImode in [0,1]:
+    print '%i %i' % (Obs,FPImode)
+
+    dir = '/Users/gbclark1/Desktop/cdf_files/'
+    data = create_counts_matrix(dir)
+    counts = data[0]
+    serial = data[1]
+    threshs = data[2]
+    mcps = data[3]
+    aaxts = data[4]
+
+
+    ## This code reads in the IDL save files which are produced by the FPI fetch tools
+    # fname = 'IDLDataObs%i_FPI008_corrected' % (Obs)
+    # oppt_data = io.readsav('%s.sav' % fname)
+    # counts_idl = oppt_data['data']['counts']
+    # threshs_idl = oppt_data['data']['thresh']
+    # energy_idl = oppt_data['data']['energy']
+    # mcps_idl = oppt_data['data']['mcpvlt']
+    # aaxts_idl = oppt_data['data']['anodxt']
+    # serial_idl = oppt_data['data']['serial']
+    # # pdb.set_trace()
+    #serial = np.array([203, 203, 204, 204, 201, 201, 202, 202,  14,  14,   1,   1,   9, 9,  12,  12]) #until the CDF file is updated
+
+
+    oppt_param = np.zeros((len(counts),2,16,5,2),np.float)
+    
+    op_Gammas = np.zeros(16,np.float)    
+    op_Qs = np.zeros(16,np.float)
+
+
+    for head in [0,1]:     
+        for cii in range(len(counts)):
+             if (FPImode == 0 and serial[cii] > 200) or (FPImode == 1 and serial[cii] < 200):
+                 coppt_param = proc_tswp(counts,threshs[cii][head],mcps[cii][head],aaxts[cii],serial[cii],head,cii)
+                 oppt_param[cii,head,:,:,:] = coppt_param[cii,head,:,:,:]
+                 
+ Qs = oppt_param[cii,head,:,0,0]
+ gammas = oppt_param[cii,head,:,1,0]
+ 
+
+
+ use_px = np.where(np.abs(Qs-np.mean(Qs)) < np.std(Qs)*1.96)[0]
+ print use_px
+
+ p_Gammas = np.polyfit(pxs[use_px],gammas[use_px],4)
+ p_Qs = np.polyfit(pxs[use_px],Qs[use_px],4)
+ 
+ 
+ op_Gammas = p_Gammas
+ op_Qs = p_Qs                
+ 
+ # if cii % 2 == 1:  #what does this do??
+     
+
+     
+     
+ Qs_op = np.mean(np.polyval(p_Qs,pxs))
+ Qs_opplus = np.mean(np.polyval(op_Qs,pxs))
+ minQ = np.min(np.polyval(p_Qs,pxs))
+ etaG = 1. - special.gammainc(1.1,4.0e5/minQ)
+ print serial[cii],head,np.min(np.polyval(p_Qs,pxs)),etaG
+ dlogQdV = (np.log10(Qs_opplus)-np.log10(Qs_op))/50.
+
+ if serial[cii] < 200:
+     dlogQdV = -dlogQdV
+
+ prefix = 'FM%sH%i' % (str(serial[cii]).zfill(3),head)
+ print prefix
+    #/Users/gbclark1/Documents/Python_scripts/oppt_cal_gclark/specfits/specfit_ground
+ fname = '/Users/gbclark1/Documents/Python_Scripts/oppt_cal_gclark/specfits/specfit_ground/' + prefix + '_ground.csv'
+ ofname = '/Users/gbclark1/Documents/Python_Scripts/oppt_cal_gclark/specfits/specfit_FPI008/' + prefix + '_FPI008.csv'
+ #fname = 'C:\\Users\\djgersh\\Documents\\FPI\\Bursts\\specfit_ground\\' + prefix + '_ground.csv'
+ #ofname = 'C:\\Users\\djgersh\\Documents\\FPI\\Bursts\\specfit_FPI008\\' + prefix + '_FPI008.csv'
+# pdb.set_trace()
+ with open(fname, 'r') as input_file, open(ofname, 'w') as output_file:
+     l = 0
+     for line in input_file:
+         pdb.set_trace()
+         if l == 23:
+             output_file.write('%i\t%i\t%i\t%i\t%i\n' % (p_Qs[0],p_Qs[1],p_Qs[2],p_Qs[3],p_Qs[4]))
+         elif l == 25:
+             output_file.write('0.000e+00\t0.000e+00\t0.000e+00\t0.000e+00\t1.100e+00\n')
+         elif l == 27:
+             output_file.write('%.3e\n' % dlogQdV)
+         else:
+             output_file.write(line)
+
+         l+=1
+             
+                 
+                 

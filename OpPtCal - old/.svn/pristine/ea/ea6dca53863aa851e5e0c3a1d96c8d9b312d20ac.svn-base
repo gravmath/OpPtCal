@@ -1,0 +1,83 @@
+# -*- coding: utf-8 -*-
+"""
+############################################################
+#         proc_OpPtCal_orbitCDF_wrapper_v2.py
+#
+#  Mission:  MMS
+#
+#  Subsytem: Fast Plasma Instrument (FPI)
+#
+#  Author:   Daniel J. Gershman (daniel.j.gershman@nasa.gov)
+#            Conrad Schiff (conrad.schiff-1@nasa.gov)
+#
+#  Purpose:  Scans the Operating Calibration data paths and
+#            the CDF files and adds any unanalyzed data to 
+#            a queque for processing
+#
+#  Language: Python 2.7
+#
+#  Packages: glob
+#            os
+#            opptcal_paths
+#
+#  History:  1) Initial version (D. Gershman) 4/6/2015
+#            2) Updated for flexi-paths (C. Schiff) 1/6/2016
+#
+#  $LastChangedBy$
+#  $LastChangedDate$
+#  $LastChangedRevision$
+#
+#  Copyright 2015 NASA Goddard Space Flight Center
+"""
+
+__contact__ = 'Dan Gershman (daniel.j.gershman@nasa.gov)'
+import os as os
+import glob as glob
+import opptcal_paths as paths
+
+#use flexi-paths
+specfit_dir = paths.OpPt_specfit_dir 
+output_dir  = paths.OpPt_output_path 
+
+#open the batch file
+proc_script = open('%s/procOpPt.bat' % paths.OpPt_code_path,'w')  
+
+#loop over the observatories
+for obs in [1,2,3,4]:
+
+    data_path = paths.OpPt_data_path % obs
+    
+	#read the base data path where the cdf files are held on the server
+    if os.path.exists(data_path):
+    
+	    #find all the subdirectories
+        dirs = os.listdir(data_path)
+
+        #loop over the subdirectories looking for any new data 
+        #(either late arrivals or genuinely new data) and check
+        # the 'analyzed' subdirectory to look for 16 or more
+        #*.csv, which indicates that the directory has already been 
+        #analyzed        
+        for oppt_dir in dirs:
+            
+            if '.' not in oppt_dir:
+                
+                orbitnum = int(oppt_dir.split('-')[0].split('_')[0])
+                
+				#orbits before 245 are excluded for reasons unknown (CS)
+                if orbitnum < 245:
+                    continue
+                oppt_files = glob.glob('%s/%s/analyzed/*_oppt.csv' % (data_path,oppt_dir))  
+
+                
+                    
+                if len(oppt_files) >= 16:
+                    continue    
+                else:
+                    print '%s: adding to MMS%i processing list' % (oppt_dir,obs)
+          
+                temp_str = 'python %s/proc_OpPtCal_orbitCDF_v2.py %s %s %s\n' % (paths.OpPt_code_path, data_path, oppt_dir, specfit_dir)          
+                proc_script.write(temp_str.replace('/','\\'))                
+
+#proc_script.write('pause\n')
+proc_script.close()
